@@ -13,4 +13,8 @@ dependencies = [
     "httpx",
     "litellm",
     "pytest",
+    # Verifying Open WebUI's signed user token. Only used when
+    # FORWARD_USER_INFO_HEADER_JWT_SECRET is set, but listed unconditionally so
+    # that turning the feature on is a config change and not an install.
+    "pyjwt",
 ]

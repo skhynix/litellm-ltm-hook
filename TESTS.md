@@ -2,11 +2,12 @@
 
 This guide covers the current MemMachine integration in `litellm-ltm-hook`.
 
-Three test files, in increasing scope:
+Four test files, in increasing scope:
 
 | File | Scope | Requires |
 |------|-------|----------|
 | `test_hook.py` | unit + live (httpx-mocked + direct MemMachine API) | `httpx`, `pytest`; live needs `MEMMACHINE_BASE_URL` set and reachable |
+| `test_identity.py` | unit: the forwarded signed-identity path | `pyjwt`, `pytest`; no network |
 | `test_e2e_store.py` | end-to-end store path through the litellm proxy | litellm-test proxy up, virtual key, MemMachine up |
 | `test_e2e_recall.py` | end-to-end 2-turn recall through the litellm proxy | same as above |
 | `tools/cleanup_memories.py` | utility: delete all episodic memories in a project | MemMachine up |

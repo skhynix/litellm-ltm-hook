@@ -40,13 +40,33 @@ Environment variables:
                          XML-like wrapper blocks from the text used for memory
                          search/store. The original LLM request is not changed.
   MEMMACHINE_DEBUG       1 = log search/store failures to stderr.
+  FORWARD_USER_INFO_HEADER_JWT_SECRET  the secret Open WebUI signs its user token
+                         with (same name as Open WebUI's own variable). Unset is the
+                         default and leaves identity exactly as it was: the virtual
+                         key owner's email, with x-memmachine-* namespace selection.
+                         Set it, and a request carrying a valid token is identified
+                         by the token instead. Requires PyJWT.
+  MEMMACHINE_FORWARDED_USER_JWT_HEADER  default x-openwebui-user-jwt
+  MEMMACHINE_FORWARDED_USER_JWT_ISSUER  default open-webui. The iss claim the token
+                         must carry.
 
 Isolation model:
-  The virtual key owner's email is the only user identity source. It is slugified
-  into the canonical user_id used by producer/produced_for and, by default, org_id.
-  A request may select another namespace with x-memmachine-org and
-  x-memmachine-project. Without those headers, alice@example.com maps to
+  Identity is the virtual key owner's email, or the verified email claim of Open
+  WebUI's signed token when one is present. The token wins: behind a single shared
+  virtual key the key names the application and only the token names the person.
+  Either way the email is slugified into the canonical user_id used by
+  producer/produced_for and, by default, org_id. alice@example.com maps to
   user_id=alice_example_com, org_id=alice_example_com, project_id=default.
+
+  x-memmachine-org and x-memmachine-project select another namespace. They are
+  refused with 401 on a token-identified request, because there the token is the
+  only thing separating one person from the next. On a virtual-key request they
+  work as before and, as README notes, are still unauthorized: a key owned by
+  alice can name bob's namespace. This does not change that either way.
+
+  The email in a token is only as trustworthy as the account system behind Open
+  WebUI, since a token-identified user and a virtual-key user with the same email
+  share one namespace. See README for what that requires of a deployment.
   Episodic isolation is the selected (org_id, project_id) namespace; producer_id
   records provenance inside that namespace and is not used as a search boundary.
   Semantic searches use MemMachine's default org-set + project-set scope.
@@ -85,6 +105,11 @@ from typing import Optional
 
 import httpx
 from litellm.integrations.custom_logger import CustomLogger
+
+try:  # PyJWT. Only needed when the forwarded-identity path is switched on.
+    import jwt
+except ImportError:  # pragma: no cover - exercised by deployments without PyJWT
+    jwt = None
 
 
 def _load_env_file() -> None:
@@ -139,6 +164,68 @@ MODEL_ALLOWLIST = {
     m.strip() for m in os.environ.get("MEMMACHINE_MODELS", "").split(",") if m.strip()
 }
 MODEL_PREFIX = os.environ.get("MEMMACHINE_MODEL_PREFIX", "memmachine-")
+
+# Forwarded identity. Unset secret = off, and the hook behaves exactly as before.
+# The variable deliberately carries Open WebUI's own name: it is the same secret,
+# and giving it a second name invites the two sides to drift apart.
+FORWARD_USER_INFO_HEADER_JWT_SECRET = os.environ.get(
+    "FORWARD_USER_INFO_HEADER_JWT_SECRET"
+)
+FORWARDED_USER_JWT_HEADER = os.environ.get(
+    "MEMMACHINE_FORWARDED_USER_JWT_HEADER", "x-openwebui-user-jwt"
+)
+FORWARDED_USER_JWT_ISSUER = os.environ.get(
+    "MEMMACHINE_FORWARDED_USER_JWT_ISSUER", "open-webui"
+)
+# Open WebUI stamps iat and exp from its own clock. Two services, two clocks:
+# without a margin, an Open WebUI host a couple of seconds ahead makes PyJWT
+# raise ImmatureSignatureError on every single request, which reads like a bad
+# secret rather than a clock. The margin applies to iat, nbf and exp alike.
+# Read only when the feature is on. A malformed value is worth refusing to
+# start over, but not for a deployment that never asked for this: with the
+# secret unset, nothing here may change how the hook loads.
+FORWARDED_USER_JWT_LEEWAY = 30
+if FORWARD_USER_INFO_HEADER_JWT_SECRET:
+    try:
+        FORWARDED_USER_JWT_LEEWAY = max(
+            0, int(os.environ.get("MEMMACHINE_FORWARDED_USER_JWT_LEEWAY", "30"))
+        )
+    except ValueError:
+        raise RuntimeError(
+            "MEMMACHINE_FORWARDED_USER_JWT_LEEWAY must be a whole number of seconds"
+        ) from None
+
+if FORWARD_USER_INFO_HEADER_JWT_SECRET and jwt is not None and not hasattr(
+    jwt, "PyJWTError"
+):
+    # `jwt` is also the name of an unrelated package on PyPI. Importing that one
+    # gives a module with a different decode signature, which would fail inside
+    # every verification and turn every request into a 401 that looks like a bad
+    # token. Say so once, at startup, instead.
+    raise RuntimeError(
+        "The installed `jwt` module is not PyJWT (it has no PyJWTError). Another "
+        "package of that name is shadowing it; install pyjwt and remove the other."
+    )
+
+if FORWARD_USER_INFO_HEADER_JWT_SECRET and jwt is None:
+    raise RuntimeError(
+        "FORWARD_USER_INFO_HEADER_JWT_SECRET is set but PyJWT is not importable. "
+        "Install it (pip install pyjwt), or unset the variable to keep identity "
+        "on the virtual key alone."
+    )
+
+if (
+    FORWARD_USER_INFO_HEADER_JWT_SECRET
+    and len(FORWARD_USER_INFO_HEADER_JWT_SECRET.encode()) < 32
+):
+    # HS256 with a short secret can be brute-forced offline from one captured
+    # token, and every token is a request header. Warn rather than refuse: an
+    # existing deployment should not stop starting because of an upgrade.
+    logging.getLogger(f"{__name__}.errors").warning(
+        "FORWARD_USER_INFO_HEADER_JWT_SECRET is shorter than 32 bytes. HS256 with "
+        "a short secret is brute-forcible offline from a single captured token; "
+        "use at least 32 bytes of random data."
+    )
 
 _SEARCH_TYPE_VALUES = frozenset({"episodic", "semantic"})
 
@@ -205,15 +292,7 @@ def _request_headers(data: dict) -> dict:
 
 def _is_claude_code_request(data: dict) -> bool:
     """Detect Claude Code inference requests without depending on its version."""
-    headers = _request_headers(data)
-    user_agent = next(
-        (
-            value
-            for key, value in headers.items()
-            if str(key).lower() == "user-agent"
-        ),
-        "",
-    )
+    user_agent = _header(_request_headers(data), "user-agent") or ""
     return str(user_agent).strip().lower().startswith("claude-cli/")
 
 
@@ -392,7 +471,116 @@ def _to_org_id(user_id: str) -> str:
     return slug or "default"
 
 
-def _identity(data, user_api_key_dict=None):
+def _header(headers: dict, name: str):
+    """Header lookup that does not depend on the case LiteLLM happened to keep."""
+    if name in headers:
+        return headers[name]
+    want = str(name).lower()
+    for key, value in headers.items():
+        if str(key).lower() == want:
+            return value
+    return None
+
+
+def _unauthorized(message: str) -> MemMachineRequestError:
+    """A refusal to trust the caller's identity: 401 on every route it acts on.
+
+    MemMachineRequestError rather than FastAPI's HTTPException, for the reason
+    DEV.md gives: LiteLLM keeps its status_code on all three routes, and it does
+    not need the proxy extras installed.
+    """
+    return MemMachineRequestError(status_code=401, detail=message)
+
+
+def _started_at(start_time) -> Optional[float]:
+    """Epoch seconds for a LiteLLM start_time, or None if it is not a datetime.
+
+    The store path runs after the model has answered, which can be well past a
+    short-lived token's expiry. Judging the token at that moment would throw away
+    the turn the user already had. It is judged against when the request started.
+    """
+    try:
+        return start_time.timestamp()
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+
+
+def _forwarded_identity(headers: dict, valid_at: Optional[float] = None):
+    """The email from Open WebUI's signed user token, or None if there is no token.
+
+    Returns None when the feature is off or no token is present, so the caller
+    falls back to the virtual key. Raises when a token is present but not good:
+    a request that tried to prove an identity and failed must not be quietly
+    downgraded to whatever the shared key says. Also raises when a good token
+    arrives with a namespace selector, so every caller that verifies the token
+    enforces that rule too, including the pre-call hook's early check.
+    """
+    if not FORWARD_USER_INFO_HEADER_JWT_SECRET:
+        return None
+    token = _header(headers, FORWARDED_USER_JWT_HEADER)
+    if not token:
+        return None
+
+    options = {"require": ["exp", "iss", "email"]}
+    if valid_at is not None:
+        # Checked below against the request's own start, not against now.
+        options["verify_exp"] = False
+    try:
+        claims = jwt.decode(
+            token,
+            FORWARD_USER_INFO_HEADER_JWT_SECRET,
+            # Pinned: without it a token saying alg=none would be accepted.
+            algorithms=["HS256"],
+            issuer=FORWARDED_USER_JWT_ISSUER,
+            leeway=FORWARDED_USER_JWT_LEEWAY,
+            options=options,
+        )
+    except jwt.PyJWTError as exc:
+        # Only PyJWT's own errors mean the token is not good. Anything else — a
+        # wrong argument, a shadowed package, a broken install — is ours, and is
+        # left to surface as the server error it is rather than being reported
+        # to the caller as a bad token.
+        raise _unauthorized(
+            f"{FORWARDED_USER_JWT_HEADER} could not be verified: {type(exc).__name__}"
+        ) from exc
+
+    if valid_at is not None:
+        try:
+            expires_at = float(claims["exp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _unauthorized(
+                f"{FORWARDED_USER_JWT_HEADER} has no usable exp claim"
+            ) from exc
+        if valid_at > expires_at + FORWARDED_USER_JWT_LEEWAY:
+            raise _unauthorized(
+                f"{FORWARDED_USER_JWT_HEADER} had already expired when the request "
+                "started"
+            )
+
+    email = claims.get("email")
+    if not email or not str(email).strip():
+        raise _unauthorized(
+            f"{FORWARDED_USER_JWT_HEADER} carries no email claim"
+        )
+
+    # Here the namespace IS the identity. Verifying who the caller is and then
+    # letting a header say which memories to read gives back exactly what the
+    # signature was introduced to take away: one header, plus a valid token of
+    # your own, reads a colleague's memories. Refuse rather than ignore — a
+    # caller sending these is either misconfigured or probing, and both should
+    # be visible.
+    for name in ("x-memmachine-org", "x-memmachine-project"):
+        # A blank value means "not selected", as on the virtual-key path.
+        if str(_header(headers, name) or "").strip():
+            raise _unauthorized(
+                f"{name} is not accepted on a request identified by "
+                f"{FORWARDED_USER_JWT_HEADER}: the namespace is derived from the "
+                "verified user identity"
+            )
+    return str(email).strip()
+
+
+def _identity(data, user_api_key_dict=None, valid_at=None):
     """Extract canonical user_id / org_id / project_id / session_id.
 
     Auth info arrives in two shapes:
@@ -400,45 +588,64 @@ def _identity(data, user_api_key_dict=None):
     - async_log_success_event: flattened user_api_key_* fields inside
       kwargs.litellm_params.metadata (user_api_key_user_email).
 
-    The authenticated virtual-key owner email is the only identity source. Request
-    headers may select an org/project but cannot replace the user identity.
+    Identity is the virtual key owner's email, or the verified email claim of
+    Open WebUI's signed user token when one is present. The token wins: behind a
+    single shared virtual key the key names the application and only the token
+    names the person. `valid_at` judges the token against the moment the request
+    started rather than now, which matters on the store path.
 
     Returns (user_id, org_id, project_id, session_id) where:
-    - user_id is the slugified virtual-key email used by producer/produced_for.
-    - org_id defaults to user_id and may be overridden by x-memmachine-org.
-    - project_id defaults to MEMMACHINE_PROJECT_ID and may be overridden by
-      x-memmachine-project.
+    - user_id is the slugified email used by producer/produced_for.
+    - org_id defaults to user_id and may be overridden by x-memmachine-org, except
+      on a token-identified request, where the header is refused.
+    - project_id defaults to MEMMACHINE_PROJECT_ID, with the same rule.
     - session_id is for session-key scoping (not used for isolation).
     """
-    proxy_request = data.get("proxy_server_request") or {}
-    headers = proxy_request.get("headers") or {}
+    headers = _request_headers(data)
     metadata = data.get("metadata") or {}
 
-    user_email = (
+    forwarded_email = _forwarded_identity(headers, valid_at)
+
+    user_email = forwarded_email or (
         getattr(user_api_key_dict, "user_email", None)
         or metadata.get("user_api_key_user_email")
     )
     if not user_email or not str(user_email).strip():
-        raise ValueError("MemMachine requires a user_email on the authenticated LiteLLM virtual key")
+        raise ValueError(
+            "MemMachine requires a user identity: a user_email on the authenticated "
+            f"LiteLLM virtual key, or a verified {FORWARDED_USER_JWT_HEADER} token "
+            "(set FORWARD_USER_INFO_HEADER_JWT_SECRET)"
+        )
 
     user_id = _to_org_id(str(user_email).strip())
-    org_id = str(headers.get("x-memmachine-org") or user_id).strip()
-    project_id = str(headers.get("x-memmachine-project") or PROJECT_ID).strip()
+
+    if forwarded_email:
+        # _forwarded_identity has already refused x-memmachine-org/-project here.
+        org_id, project_id = user_id, PROJECT_ID
+    else:
+        org_id = str(_header(headers, "x-memmachine-org") or user_id).strip()
+        project_id = str(_header(headers, "x-memmachine-project") or PROJECT_ID).strip()
     if not org_id or not project_id:
         raise ValueError("MemMachine org_id and project_id must not be empty")
     session_id = (
-        headers.get("x-memmachine-session")
+        _header(headers, "x-memmachine-session")
         or metadata.get("session_id")
-        or metadata.get("user_api_key_hash")
+        # Behind a shared key the key hash is the same for everyone, so a
+        # token-identified request falls back to the person instead.
+        or (user_id if forwarded_email else metadata.get("user_api_key_hash"))
         or "default"
     )
     return user_id, org_id, project_id, str(session_id)
 
 
 def _in_scope(data) -> bool:
-    proxy_request = data.get("proxy_server_request") or {}
-    headers = proxy_request.get("headers") or {}
-    if headers.get("x-memmachine-disable") == "1":
+    """Whether the memory layer touches this request at all.
+
+    Checked before identity is resolved, so a request the hook skips never has
+    its token verified. That costs nothing: skipping means no search and no
+    store, so there is no namespace an unverified token could reach.
+    """
+    if _header(_request_headers(data), "x-memmachine-disable") == "1":
         return False
     model = data.get("model")
     _log(f"_in_scope: model={model!r}, prefix={MODEL_PREFIX!r}, allowlist={MODEL_ALLOWLIST!r}")
@@ -511,6 +718,12 @@ class MemMachineHook(CustomLogger):
         if not _in_scope(data):
             return data
 
+        # Verify a forwarded token before any of the early returns below, so a
+        # forged or expired one, or a good one sent with a namespace selector, is
+        # refused even on a request that would not have searched memory.
+        # _identity checks it again; that is cheap.
+        _forwarded_identity(_request_headers(data))
+
         # /v1/responses carries the conversation as `input` (string or list of
         # {role, content}) rather than `messages`. Normalize to a messages list so the
         # shared logic below works; the original data["input"] is never mutated.
@@ -540,6 +753,9 @@ class MemMachineHook(CustomLogger):
             _log("pre_call: <memory> block already in history, skipping re-injection")
             return data
 
+        # No valid_at here: this runs before the model is called, so "now" is
+        # the moment the request arrived. The store path runs after the answer
+        # and has to look back at when the request started instead.
         _, org_id, project_id, _ = _identity(data, user_api_key_dict)
 
         # Namespace selection, not producer_id, defines the episodic recall boundary.
@@ -766,12 +982,18 @@ class MemMachineHook(CustomLogger):
                 )
         try:
             user_id, org_id, project_id, session_id = _identity(
-                request, user_api_key_dict
+                request, user_api_key_dict, valid_at=_started_at(start_time)
             )
         except Exception as exc:
             _log_error(
                 operation="store",
-                category="unexpected",
+                # A wrong secret or issuer otherwise looks like any other
+                # failure, which is a miserable thing to diagnose from logs.
+                category=(
+                    "authentication"
+                    if isinstance(exc, MemMachineRequestError)
+                    else "unexpected"
+                ),
                 org_id="<unresolved>",
                 project_id="<unresolved>",
                 request_id=request_id,
